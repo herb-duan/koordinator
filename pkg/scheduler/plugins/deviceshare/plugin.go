@@ -40,6 +40,7 @@ import (
 	"github.com/koordinator-sh/koordinator/pkg/scheduler/frameworkext/schedulingphase"
 	"github.com/koordinator-sh/koordinator/pkg/scheduler/frameworkext/topologymanager"
 	"github.com/koordinator-sh/koordinator/pkg/scheduler/plugins/reservation"
+	utilfeature "github.com/koordinator-sh/koordinator/pkg/util/feature"
 	reservationutil "github.com/koordinator-sh/koordinator/pkg/util/reservation"
 )
 
@@ -552,6 +553,11 @@ func (p *Plugin) preBindObject(ctx context.Context, cycleState *framework.CycleS
 		return nil
 	}
 
+	// indicates we already skip our device allocation logic, leave it to kubelet
+	if state.allocationResult == nil {
+		return nil
+	}
+
 	err := p.fillID(state.allocationResult, nodeName)
 	if err != nil {
 		return framework.AsStatus(err)
@@ -559,6 +565,12 @@ func (p *Plugin) preBindObject(ctx context.Context, cycleState *framework.CycleS
 
 	if err := apiext.SetDeviceAllocations(object, state.allocationResult); err != nil {
 		return framework.NewStatus(framework.Error, err.Error())
+	}
+
+	if utilfeature.DefaultMutableFeatureGate.Enabled(features.DevicePluginAdaption) {
+		if err := p.adaptForDevicePlugin(object, state.allocationResult, nodeName); err != nil {
+			return framework.AsStatus(err)
+		}
 	}
 	return nil
 }
