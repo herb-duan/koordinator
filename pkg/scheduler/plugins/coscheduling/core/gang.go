@@ -360,13 +360,19 @@ func (gang *Gang) setChild(pod *v1.Pod) {
 	defer gang.lock.Unlock()
 
 	podId := util.GetId(pod.Namespace, pod.Name)
+	gang.Children[podId] = pod
 	if _, ok := gang.Children[podId]; !ok {
-		gang.Children[podId] = pod
-		klog.Infof("SetChild, gangName: %v, childName: %v", gang.Name, podId)
+		klog.V(6).Infof("SetChild, gangName: %v, childName: %v", gang.Name, podId)
+	} else {
+		klog.V(6).Infof("UpdateChild, gangName: %v, childName: %v", gang.Name, podId)
 	}
-	if _, ok := gang.PendingChildren[podId]; !ok && pod.Spec.NodeName == "" && gang.WaitingForBindChildren[podId] == nil {
+	if pod.Spec.NodeName == "" && gang.WaitingForBindChildren[podId] == nil {
 		gang.PendingChildren[podId] = pod
-		klog.Infof("SetPendingChild, gangName: %v, childName: %v", gang.Name, podId)
+		if _, ok := gang.PendingChildren[podId]; !ok {
+			klog.Infof("SetPendingChild, gangName: %v, childName: %v", gang.Name, podId)
+		} else {
+			klog.Infof("UpdatePendingChild, gangName: %v, childName: %v", gang.Name, podId)
+		}
 	}
 }
 
@@ -389,7 +395,9 @@ func (gang *Gang) delAssumedPod(pod *v1.Pod) {
 	podId := util.GetId(pod.Namespace, pod.Name)
 	if _, ok := gang.WaitingForBindChildren[podId]; ok {
 		delete(gang.WaitingForBindChildren, podId)
-		gang.PendingChildren[podId] = pod
+		if pendingPod := gang.Children[podId]; pendingPod != nil {
+			gang.PendingChildren[podId] = pendingPod
+		}
 		if len(gang.WaitingForBindChildren) == 0 {
 			gang.GangGroupInfo.RemoveWaitingGang(gang.Name)
 		}
