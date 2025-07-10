@@ -39,7 +39,7 @@ import (
 	"github.com/koordinator-sh/koordinator/pkg/scheduler/frameworkext"
 	"github.com/koordinator-sh/koordinator/pkg/scheduler/frameworkext/schedulingphase"
 	"github.com/koordinator-sh/koordinator/pkg/scheduler/frameworkext/topologymanager"
-	"github.com/koordinator-sh/koordinator/pkg/scheduler/plugins/reservation"
+	utilfeature "github.com/koordinator-sh/koordinator/pkg/util/feature"
 	reservationutil "github.com/koordinator-sh/koordinator/pkg/util/reservation"
 )
 
@@ -71,10 +71,12 @@ var (
 )
 
 type Plugin struct {
-	disableDeviceNUMATopologyAlignment bool
-	handle                             frameworkext.ExtendedHandle
-	nodeDeviceCache                    *nodeDeviceCache
-	scorer                             *resourceAllocationScorer
+	disableDeviceNUMATopologyAlignment         bool
+	handle                                     frameworkext.ExtendedHandle
+	nodeDeviceCache                            *nodeDeviceCache
+	gpuSharedResourceTemplatesCache            *gpuSharedResourceTemplatesCache
+	gpuSharedResourceTemplatesMatchedResources []corev1.ResourceName
+	scorer                                     *resourceAllocationScorer
 }
 
 type preFilterState struct {
@@ -95,14 +97,16 @@ type preFilterState struct {
 }
 
 type GPURequirements struct {
-	numberOfGPUs               int
-	requestsPerGPU             corev1.ResourceList
-	gpuShared                  bool
-	honorGPUPartition          bool
-	restrictedGPUPartition     bool
-	rindBusBandwidth           *resource.Quantity
-	requiredTopologyScopeLevel int
-	requiredTopologyScope      apiext.DeviceTopologyScope
+	numberOfGPUs                        int
+	requestsPerGPU                      corev1.ResourceList
+	gpuShared                           bool
+	honorGPUPartition                   bool
+	restrictedGPUPartition              bool
+	rindBusBandwidth                    *resource.Quantity
+	requiredTopologyScopeLevel          int
+	requiredTopologyScope               apiext.DeviceTopologyScope
+	enforceGPUSharedResourceTemplate    bool
+	candidateGPUSharedResourceTemplates map[string]apiext.GPUSharedResourceTemplates
 }
 
 func (s *preFilterState) Clone() framework.StateData {
@@ -173,7 +177,7 @@ func (p *Plugin) EventsToRegister() []framework.ClusterEventWithHint {
 }
 
 func (p *Plugin) PreFilter(ctx context.Context, cycleState *framework.CycleState, pod *corev1.Pod) (*framework.PreFilterResult, *framework.Status) {
-	state, status := preparePod(pod)
+	state, status := preparePod(pod, p.gpuSharedResourceTemplatesCache, p.gpuSharedResourceTemplatesMatchedResources)
 	if !status.IsSuccess() {
 		return nil, status
 	}
@@ -211,7 +215,10 @@ func (p *Plugin) AddPod(ctx context.Context, cycleState *framework.CycleState, p
 		return nil
 	}
 
-	rInfo := reservation.GetReservationCache().GetReservationInfoByPod(podInfoToAdd.Pod, node.Name)
+	var rInfo *frameworkext.ReservationInfo
+	if rCache := frameworkext.GetReservationCache(); rCache != nil {
+		rInfo = rCache.GetReservationInfoByPod(podInfoToAdd.Pod, node.Name)
+	}
 	if rInfo == nil {
 		nominator := p.handle.GetReservationNominator()
 		if nominator != nil {
@@ -267,7 +274,10 @@ func (p *Plugin) RemovePod(ctx context.Context, cycleState *framework.CycleState
 		return nil
 	}
 
-	rInfo := reservation.GetReservationCache().GetReservationInfoByPod(podInfoToRemove.Pod, node.Name)
+	var rInfo *frameworkext.ReservationInfo
+	if rCache := frameworkext.GetReservationCache(); rCache != nil {
+		rInfo = rCache.GetReservationInfoByPod(podInfoToRemove.Pod, node.Name)
+	}
 	if rInfo == nil {
 		nominator := p.handle.GetReservationNominator()
 		if nominator != nil {
@@ -552,6 +562,11 @@ func (p *Plugin) preBindObject(ctx context.Context, cycleState *framework.CycleS
 		return nil
 	}
 
+	// indicates we already skip our device allocation logic, leave it to kubelet
+	if state.allocationResult == nil {
+		return nil
+	}
+
 	err := p.fillID(state.allocationResult, nodeName)
 	if err != nil {
 		return framework.AsStatus(err)
@@ -559,6 +574,12 @@ func (p *Plugin) preBindObject(ctx context.Context, cycleState *framework.CycleS
 
 	if err := apiext.SetDeviceAllocations(object, state.allocationResult); err != nil {
 		return framework.NewStatus(framework.Error, err.Error())
+	}
+
+	if utilfeature.DefaultMutableFeatureGate.Enabled(features.DevicePluginAdaption) {
+		if err := p.adaptForDevicePlugin(object, state.allocationResult, nodeName); err != nil {
+			return framework.AsStatus(err)
+		}
 	}
 	return nil
 }
@@ -643,9 +664,16 @@ func New(obj runtime.Object, handle framework.Handle) (framework.Plugin, error) 
 	registerPodEventHandler(deviceCache, handle.SharedInformerFactory(), extendedHandle.KoordinatorSharedInformerFactory())
 	go deviceCache.gcNodeDevice(context.TODO(), handle.SharedInformerFactory(), defaultGCPeriod)
 
+	gpuSharedResourceTemplatesCache := newGPUSharedResourceTemplatesCache()
+	registerGPUSharedResourceTemplatesConfigMapEventHandler(gpuSharedResourceTemplatesCache,
+		args.GPUSharedResourceTemplatesConfig.ConfigMapNamespace, args.GPUSharedResourceTemplatesConfig.ConfigMapName,
+		handle.SharedInformerFactory())
+
 	return &Plugin{
-		handle:                             extendedHandle,
-		nodeDeviceCache:                    deviceCache,
+		handle:                          extendedHandle,
+		nodeDeviceCache:                 deviceCache,
+		gpuSharedResourceTemplatesCache: gpuSharedResourceTemplatesCache,
+		gpuSharedResourceTemplatesMatchedResources: args.GPUSharedResourceTemplatesConfig.MatchedResources,
 		scorer:                             scorePlugin(args),
 		disableDeviceNUMATopologyAlignment: args.DisableDeviceNUMATopologyAlignment,
 	}, nil

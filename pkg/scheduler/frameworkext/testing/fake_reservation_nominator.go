@@ -43,8 +43,10 @@ type FakeNominator struct {
 
 func NewFakeReservationNominator() *FakeNominator {
 	return &FakeNominator{
-		nominatedPodToNode: map[types.UID]map[string]types.UID{},
-		reservations:       map[types.UID]*frameworkext.ReservationInfo{},
+		nominatedPodToNode:        map[types.UID]map[string]types.UID{},
+		nominatedReservePod:       map[string][]*framework.PodInfo{},
+		nominatedReservePodToNode: map[types.UID]string{},
+		reservations:              map[types.UID]*frameworkext.ReservationInfo{},
 	}
 }
 
@@ -133,4 +135,17 @@ func (nm *FakeNominator) deleteReservePod(rInfo *corev1.Pod) {
 		}
 	}
 	delete(nm.nominatedReservePodToNode, rInfo.UID)
+}
+
+func (nm *FakeNominator) DeleteNominatedReservePodOrReservation(pod *corev1.Pod) {
+	nm.lock.Lock()
+	defer nm.lock.Unlock()
+
+	nodeToReservation := nm.nominatedPodToNode[pod.UID]
+	delete(nm.nominatedPodToNode, pod.UID)
+	for _, reservationUID := range nodeToReservation {
+		delete(nm.reservations, reservationUID)
+	}
+
+	nm.deleteReservePod(pod)
 }
